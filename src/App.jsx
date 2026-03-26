@@ -362,6 +362,7 @@ export default function App() {
   const [selEntitlement, setSelEntitlement] = useState(null);
   const [showManual, setShowManual] = useState(false);
   const [dismissed, setDismissed] = useState([]);
+  const [alertsVisible, setAlertsVisible] = useState(false);
   const [procStep, setProcStep] = useState(0);
   const [procDone, setProcDone] = useState(false);
   const [fileName, setFileName] = useState("");
@@ -373,7 +374,8 @@ export default function App() {
 
   const nav = (p, opts = {}) => { setPage(p); if (opts.contract) setSelContract(opts.contract); else if (p === "contracts") setSelContract(null); if (opts.entitlement) setSelEntitlement(opts.entitlement); else if (p === "entitlements") setSelEntitlement(null); };
   const activeAlerts = ALERTS.filter(a => !dismissed.includes(a.id));
-  const critCount = activeAlerts.filter(a => a.severity === "critical").length;
+  const visibleAlerts = alertsVisible ? activeAlerts : [];
+  const critCount = visibleAlerts.filter(a => a.severity === "critical").length;
   const isReady = appState === "ready";
 
   return (
@@ -406,14 +408,14 @@ export default function App() {
             {appState === "empty" && <EmptyState onStart={() => setAppState("upload")} />}
             {appState === "upload" && <UploadState fileName={fileName} setFileName={setFileName} dragging={dragging} setDragging={setDragging} onSubmit={startProcessing} />}
             {appState === "processing" && <ProcessingState step={procStep} done={procDone} fileName={fileName} onContinue={() => setAppState("review")} />}
-            {appState === "review" && <ReviewState onActivate={() => { setAppState("ready"); setPage("dashboard"); }} />}
+            {appState === "review" && <ReviewState onActivate={() => { setAppState("ready"); setPage("dashboard"); setTimeout(() => setAlertsVisible(true), 2000); }} />}
           </>}
 
-          {isReady && page === "dashboard" && <DashboardView nav={nav} alerts={activeAlerts} />}
+          {isReady && page === "dashboard" && <DashboardView nav={nav} alerts={visibleAlerts} />}
           {isReady && page === "contracts" && <ContractsView nav={nav} sel={selContract} setSel={setSelContract} />}
           {isReady && page === "entitlements" && <EntitlementsView nav={nav} sel={selEntitlement} setSel={setSelEntitlement} />}
           {isReady && page === "usage" && <UsageView showManual={showManual} setShowManual={setShowManual} />}
-          {isReady && page === "alerts" && <AlertsView alerts={activeAlerts} dismiss={id => setDismissed([...dismissed, id])} nav={nav} />}
+          {isReady && page === "alerts" && <AlertsView alerts={visibleAlerts} dismiss={id => setDismissed([...dismissed, id])} nav={nav} />}
           {isReady && page === "renewal" && <RenewalView />}
           {isReady && page === "settings" && <SettingsView />}
         </div>
@@ -763,40 +765,163 @@ function VAChatPanel() {
   const [sentMessages, setSentMessages] = useState([]);
   const [inputText, setInputText] = useState("");
   const [botThinking, setBotThinking] = useState(false);
-  const [playState, setPlayState] = useState("idle");
+  const [playState, setPlayState] = useState("idle"); // idle | playing | waiting | done
+  const [msgIndex, setMsgIndex] = useState(0);
   const chatContainerRef = useRef(null);
   const timeoutRef = useRef(null);
   const intervalRef = useRef(null);
-  const conv = activeConv ? VA_CONVERSATIONS.find(c => c.id === activeConv) : null;
+
+  // A 4th "manual typing" conversation for the input field
+  const MANUAL_CONV = {
+    id: "manual", label: "Custom Question",
+    prompt: "How much budget would we save if we reduced sub-production usage to 10%?",
+    messages: [
+      { role: "user", text: "How much budget would we save if we reduced sub-production usage to 10%?" },
+      { role: "assistant", text: null, widget: "env_split" },
+      { role: "assistant", text: "Currently **35% of your assists (16,800)** come from sub-production. Reducing to 10% would mean only **4,820 assists** in sub-prod — a saving of **11,980 assists** (€11,080).\n\nYour total consumption would drop from 48,200 to approximately **36,220 assists** — freeing up **€11K of budget** that could be redirected to production deployment.\n\nPractically, this means implementing gated test policies and sample-size testing. The 10% target is achievable if you disable Now Assist by default in dev/test and only enable for specific QA sprints.\n\n**Net impact:** €11,080 annual savings + better production utilization metrics for renewal negotiation." },
+      { role: "user", text: "Can you show me the projected numbers if we implement all governance controls?" },
+      { role: "assistant", text: "If you implement all four recommended governance controls:\n\n**1. Gated test policies** → Sub-prod drops from 35% to ~10% (save 11,980 assists)\n**2. Agent optimization** → Split Onboarding Orchestrator (save 1,200 assists/yr)\n**3. Full Code Assist rollout** → Add 3,900 assists of productive usage\n**4. Expand Incident Summarization** → Add ~8,000 assists of productive usage\n\n**Projected year-end:** ~82,000 assists (41% utilization), up from 70,500 (35%).\n\n**Financial impact:**\n• Production value realized: **€75,850** (up from €44,600)\n• Sub-prod waste reduced by: **€11,080**\n• Total improvement: **€42,330** in better value realization\n• Remaining unused: **€109,150** (vs €119,900 today)\n\nThis still leaves significant headroom — strong evidence for negotiating a **reduced entitlement** at renewal, potentially saving €50-80K on the next contract." },
+    ]
+  };
+
+  const conv = activeConv ? (activeConv === "manual" ? MANUAL_CONV : VA_CONVERSATIONS.find(c => c.id === activeConv)) : null;
   const clearTimers = () => { if (timeoutRef.current) { clearTimeout(timeoutRef.current); timeoutRef.current = null; } if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; } };
-  const playMessage = (convData, idx) => {
-    if (idx >= convData.messages.length) { setPlayState("done"); return; }
+
+  // Play bot responses for a given starting index (skips user messages — those are already shown)
+  const playBotResponses = (convData, idx) => {
+    if (idx >= convData.messages.length) { setPlayState("waiting"); setMsgIndex(idx); return; }
     const msg = convData.messages[idx];
     if (msg.role === "user") {
-      const fullText = msg.text; let charPos = 0; setInputText("");
-      intervalRef.current = setInterval(() => { charPos++; if (charPos > fullText.length) { clearInterval(intervalRef.current); intervalRef.current = null; setInputText(fullText); timeoutRef.current = setTimeout(() => { setSentMessages(prev => [...prev, msg]); setInputText(""); timeoutRef.current = setTimeout(() => playMessage(convData, idx + 1), 400); }, 600); } else { setInputText(fullText.slice(0, charPos)); } }, 38 + Math.floor(Math.random() * 25));
-    } else {
-      setBotThinking(true);
-      const delay = msg.widget ? 700 : 1600 + Math.floor(Math.random() * 600);
-      timeoutRef.current = setTimeout(() => { setBotThinking(false); setSentMessages(prev => [...prev, msg]); const nextMsg = convData.messages[idx + 1]; const pauseTime = nextMsg && nextMsg.role === "user" ? 1800 : 300; timeoutRef.current = setTimeout(() => playMessage(convData, idx + 1), pauseTime); }, delay);
+      // Next user message — stop and wait for click
+      setPlayState("waiting");
+      setMsgIndex(idx);
+      return;
+    }
+    // Bot message — show thinking then reveal
+    setBotThinking(true);
+    const delay = msg.widget ? 600 : 1400 + Math.floor(Math.random() * 400);
+    timeoutRef.current = setTimeout(() => {
+      setBotThinking(false);
+      setSentMessages(prev => [...prev, msg]);
+      timeoutRef.current = setTimeout(() => playBotResponses(convData, idx + 1), 300);
+    }, delay);
+  };
+
+  // FAQ click: show all messages from first user + start bot responses
+  const startFAQ = (convId) => {
+    clearTimers();
+    const convData = VA_CONVERSATIONS.find(c => c.id === convId);
+    setActiveConv(convId);
+    // Immediately show first user message
+    setSentMessages([convData.messages[0]]);
+    setInputText("");
+    setBotThinking(false);
+    setPlayState("playing");
+    setMsgIndex(1);
+    setExpanded(true);
+    // Start bot response chain from index 1
+    timeoutRef.current = setTimeout(() => playBotResponses(convData, 1), 500);
+  };
+
+  // Input field click: start fake-typing the manual question
+  const startManualTyping = () => {
+    if (playState === "playing") return; // already typing
+    clearTimers();
+    if (!activeConv) {
+      // First time — start manual conversation
+      setActiveConv("manual");
+      setExpanded(true);
+      setSentMessages([]);
+      setMsgIndex(0);
+    }
+    const convData = activeConv === "manual" ? MANUAL_CONV : (conv || MANUAL_CONV);
+    const nextUserMsg = convData.messages[msgIndex];
+    if (!nextUserMsg || nextUserMsg.role !== "user") return;
+
+    setPlayState("playing");
+    const fullText = nextUserMsg.text;
+    let charPos = 0;
+    setInputText("");
+    intervalRef.current = setInterval(() => {
+      charPos++;
+      if (charPos > fullText.length) {
+        clearInterval(intervalRef.current); intervalRef.current = null;
+        setInputText(fullText);
+        // "Send" after brief pause
+        timeoutRef.current = setTimeout(() => {
+          setSentMessages(prev => [...prev, nextUserMsg]);
+          setInputText("");
+          const nextIdx = msgIndex + 1;
+          setMsgIndex(nextIdx);
+          // Play bot responses
+          timeoutRef.current = setTimeout(() => playBotResponses(convData, nextIdx), 400);
+        }, 600);
+      } else {
+        setInputText(fullText.slice(0, charPos));
+      }
+    }, 35 + Math.floor(Math.random() * 25));
+  };
+
+  // When a conversation is active and waiting, clicking input triggers next user message typing
+  const handleInputClick = () => {
+    if (!activeConv) {
+      // No conversation yet — start manual
+      setActiveConv("manual");
+      setExpanded(true);
+      setSentMessages([]);
+      setMsgIndex(0);
+      setPlayState("idle");
+      // Small delay then start typing
+      setTimeout(() => {
+        const fullText = MANUAL_CONV.messages[0].text;
+        let charPos = 0;
+        setPlayState("playing");
+        setInputText("");
+        intervalRef.current = setInterval(() => {
+          charPos++;
+          if (charPos > fullText.length) {
+            clearInterval(intervalRef.current); intervalRef.current = null;
+            setInputText(fullText);
+            timeoutRef.current = setTimeout(() => {
+              setSentMessages([MANUAL_CONV.messages[0]]);
+              setInputText("");
+              setMsgIndex(1);
+              timeoutRef.current = setTimeout(() => playBotResponses(MANUAL_CONV, 1), 400);
+            }, 600);
+          } else { setInputText(fullText.slice(0, charPos)); }
+        }, 35 + Math.floor(Math.random() * 25));
+      }, 200);
+      return;
+    }
+    if (playState === "waiting" && conv) {
+      const nextMsg = conv.messages[msgIndex];
+      if (nextMsg && nextMsg.role === "user") {
+        startManualTyping();
+      }
     }
   };
-  const startConversation = (convId) => { clearTimers(); const convData = VA_CONVERSATIONS.find(c => c.id === convId); setActiveConv(convId); setSentMessages([]); setInputText(""); setBotThinking(false); setPlayState("playing"); setExpanded(true); timeoutRef.current = setTimeout(() => playMessage(convData, 0), 700); };
-  const reset = () => { clearTimers(); setActiveConv(null); setSentMessages([]); setInputText(""); setBotThinking(false); setPlayState("idle"); };
+
+  const reset = () => { clearTimers(); setActiveConv(null); setSentMessages([]); setInputText(""); setBotThinking(false); setPlayState("idle"); setMsgIndex(0); };
   useEffect(() => () => clearTimers(), []);
   useEffect(() => { if (chatContainerRef.current) chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight; }, [sentMessages, inputText, botThinking]);
+
   const renderMarkdown = (text) => text.split("\n").map((line, li) => {
     if (line.startsWith("|") && line.includes("|")) { const cells = line.split("|").filter(c => c.trim()).map(c => c.trim()); if (cells.every(c => /^[-:]+$/.test(c))) return null; const isHeader = text.split("\n")[li + 1]?.includes("---"); return <div key={li} style={{ display: "grid", gridTemplateColumns: `repeat(${cells.length}, 1fr)`, gap: 0, fontSize: 11 }}>{cells.map((c, ci) => <div key={ci} style={{ padding: "4px 8px", borderBottom: `1px solid ${T.chromeDividerSubtle}`, fontWeight: isHeader ? 600 : 400, background: isHeader ? T.surface1 : "transparent" }}>{c}</div>)}</div>; }
     const formatted = line.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/•\s/g, `<span style="color:${PP}">  ●  </span>`);
     return <div key={li} style={{ marginBottom: line === "" ? 8 : 2, minHeight: line === "" ? 4 : "auto" }} dangerouslySetInnerHTML={{ __html: formatted || "&nbsp;" }} />;
   }).filter(Boolean);
+
   const MiniWidget = ({ type }) => {
     if (type === "budget_summary") return <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 6, padding: T.s2, background: T.surface1, borderRadius: T.rSm, marginBottom: T.s2 }}>{[{ l: "Burned", v: "48.2K / 200K", c: PP }, { l: "Projected EOY", v: "70.5K (35%)", c: T.negative }, { l: "€ Unused", v: "€119,900", c: T.negative }].map((k, i) => <div key={i} style={{ textAlign: "center", padding: 6 }}><div style={{ fontSize: 9, color: T.textTertiary, textTransform: "uppercase", fontWeight: 600 }}>{k.l}</div><div style={{ fontSize: 14, fontWeight: 700, color: k.c }}>{k.v}</div></div>)}</div>;
     if (type === "agent_table") return <div style={{ padding: T.s2, background: T.surface1, borderRadius: T.rSm, marginBottom: T.s2, fontSize: 11 }}>{[{ n: "Onboarding Orchestrator", c: "€1,665", s: "Large", cl: T.negative }, { n: "Change Risk Assessment", c: "€1,295", s: "Med", cl: T.warning }, { n: "Knowledge Article", c: "€1,018", s: "Med", cl: T.warning }, { n: "Incident Triage", c: "€971", s: "Small", cl: T.positive }].map((a, i) => <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "4px 0", borderBottom: i < 3 ? `1px solid ${T.chromeDividerSubtle}` : "none" }}><span>{a.n}</span><div style={{ display: "flex", alignItems: "center", gap: 8 }}><Badge variant={a.cl === T.positive ? "success" : a.cl === T.warning ? "warning" : "critical"}>{a.s}</Badge><span style={{ fontWeight: 700, minWidth: 50, textAlign: "right" }}>{a.c}</span></div></div>)}</div>;
     if (type === "env_split") return <div style={{ display: "flex", alignItems: "center", gap: T.s3, padding: T.s2, background: T.surface1, borderRadius: T.rSm, marginBottom: T.s2 }}><div style={{ width: 48, height: 48, borderRadius: "50%", background: `conic-gradient(${PP} 0% 65%, ${T.warning} 65% 100%)`, display: "flex", alignItems: "center", justifyContent: "center" }}><div style={{ width: 30, height: 30, borderRadius: "50%", background: T.surface1 }} /></div><div style={{ flex: 1 }}><div style={{ display: "flex", gap: T.s3, fontSize: 11 }}><span><span style={{ display: "inline-block", width: 8, height: 8, borderRadius: 2, background: PP, marginRight: 4, verticalAlign: "middle" }} />Prod: 65%</span><span><span style={{ display: "inline-block", width: 8, height: 8, borderRadius: 2, background: T.warning, marginRight: 4, verticalAlign: "middle" }} />Sub-prod: 35%</span></div><div style={{ fontSize: 10, color: T.negative, fontWeight: 600, marginTop: 4 }}>35% sub-prod = €15,540 non-production</div></div></div>;
     return null;
   };
+
   const isTypingUser = playState === "playing" && inputText.length > 0;
+  const canClickInput = (!activeConv) || (playState === "waiting" && conv && conv.messages[msgIndex]?.role === "user");
+  const inputHint = !activeConv ? "Ask a question about your Now Assist entitlement..." : (playState === "waiting" && conv?.messages[msgIndex]?.role === "user") ? "Click to ask follow-up..." : playState === "done" || (playState === "waiting" && !conv?.messages[msgIndex]) ? "Conversation complete" : "...";
+
   return (
     <Card style={{ marginBottom: T.s4, padding: 0, overflow: "hidden" }}>
       <div onClick={() => setExpanded(!expanded)} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: `${T.s3} ${T.s4}`, cursor: "pointer", background: T.purpleLight, borderBottom: expanded ? `1px solid ${T.chromeDividerSubtle}` : "none" }}>
@@ -807,15 +932,18 @@ function VAChatPanel() {
         <div style={{ display: "flex", alignItems: "center", gap: T.s2 }}><Badge variant="purple">AI-Powered</Badge><I n={expanded ? "chevDown" : "chevRight"} s={16} c={T.textTertiary} /></div>
       </div>
       {expanded && <div style={{ padding: T.s4 }}>
+        {/* FAQ cards — always visible when no active conv */}
         {!activeConv && <div>
-          <div style={{ fontSize: 12, color: T.textTertiary, marginBottom: T.s3 }}>Choose a conversation to watch:</div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: T.s3 }}>
-            {VA_CONVERSATIONS.map(c => <div key={c.id} onClick={() => startConversation(c.id)} style={{ padding: T.s4, border: `1px solid ${T.chromeDividerSubtle}`, borderRadius: T.rMd, cursor: "pointer", borderLeft: `3px solid ${PP}`, transition: "all .15s" }} onMouseEnter={e => { e.currentTarget.style.background = T.purpleLight; }} onMouseLeave={e => { e.currentTarget.style.background = "transparent"; }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: T.textSecondary, marginBottom: T.s3 }}>Frequently Asked Questions</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: T.s3, marginBottom: T.s4 }}>
+            {VA_CONVERSATIONS.map(c => <div key={c.id} onClick={() => startFAQ(c.id)} style={{ padding: T.s4, border: `1px solid ${T.chromeDividerSubtle}`, borderRadius: T.rMd, cursor: "pointer", borderLeft: `3px solid ${PP}`, transition: "all .15s" }} onMouseEnter={e => { e.currentTarget.style.background = T.purpleLight; }} onMouseLeave={e => { e.currentTarget.style.background = "transparent"; }}>
               <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: T.s2 }}><I n="msgCircle" s={13} c={PP} /><span style={{ fontSize: 12, fontWeight: 600, color: PP }}>{c.label}</span></div>
               <div style={{ fontSize: 12, color: T.textSecondary, lineHeight: 1.4 }}>"{c.prompt}"</div>
             </div>)}
           </div>
         </div>}
+
+        {/* Active conversation */}
         {activeConv && conv && <div>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: T.s3 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 6 }}><I n="msgCircle" s={13} c={PP} /><span style={{ fontSize: 12, fontWeight: 600, color: PP }}>{conv.label}</span>{playState === "playing" && <span style={{ fontSize: 10, color: T.negative, fontStyle: "italic", marginLeft: T.s2, display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 6, height: 6, borderRadius: "50%", background: T.negative, animation: "dotpulse 1.5s infinite" }} />Live</span>}</div>
@@ -830,15 +958,24 @@ function VAChatPanel() {
             </div>)}
             {botThinking && <div style={{ display: "flex", gap: T.s2, marginBottom: T.s3 }}><div style={{ width: 26, height: 26, borderRadius: T.rMd, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", background: T.purpleLight }}><I n="bot" s={12} c={PP} /></div><div style={{ padding: `${T.s3} ${T.s4}`, borderRadius: "12px 12px 12px 2px", background: "#fff", border: `1px solid ${T.chromeDividerSubtle}`, display: "flex", gap: 4, alignItems: "center" }}>{[0, 1, 2].map(i => <div key={i} style={{ width: 6, height: 6, borderRadius: "50%", background: PP, opacity: 0.4, animation: `dotpulse 1.2s ease-in-out ${i * 0.2}s infinite` }} />)}</div></div>}
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: T.s2, padding: `${T.s2} ${T.s3}`, background: "#fff", border: `1px solid ${isTypingUser ? PP : T.chromeDivider}`, borderRadius: T.rMd, marginTop: T.s3, transition: "border-color .2s", boxShadow: isTypingUser ? `0 0 0 2px ${PP}18` : "none" }}>
-            <I n="search" s={13} c={isTypingUser ? PP : T.textTertiary} />
-            <div style={{ flex: 1, fontSize: 12, minHeight: 18, display: "flex", alignItems: "center" }}>
-              {inputText ? <span style={{ color: T.textPrimary }}>{inputText}<span style={{ display: "inline-block", width: 2, height: 14, background: PP, marginLeft: 1, verticalAlign: "text-bottom", animation: "caret 1s step-end infinite" }} /></span> : <span style={{ color: T.textTertiary }}>{playState === "done" ? "Ask a follow-up question..." : "Ask anything about Now Assist..."}</span>}
-            </div>
-            <div style={{ width: 26, height: 26, borderRadius: T.rMd, background: isTypingUser ? PP : T.surface1, display: "flex", alignItems: "center", justifyContent: "center", transition: "all .3s" }}><I n="send" s={12} c={isTypingUser ? "#fff" : T.textTertiary} /></div>
-          </div>
-          <div style={{ marginTop: T.s3, display: "flex", alignItems: "center", gap: 6, fontSize: 10, color: T.textTertiary }}><I n="database" s={10} c={T.textTertiary} /><span>Data: sys_gen_ai_usage_log, Subscription Mgmt v2, ContractIQ</span></div>
         </div>}
+
+        {/* Input field — always visible */}
+        <div onClick={canClickInput ? handleInputClick : undefined} style={{
+          display: "flex", alignItems: "center", gap: T.s2, padding: `${T.s2} ${T.s3}`,
+          background: "#fff", border: `1px solid ${isTypingUser ? PP : T.chromeDivider}`,
+          borderRadius: T.rMd, marginTop: activeConv ? T.s3 : 0,
+          transition: "border-color .2s", boxShadow: isTypingUser ? `0 0 0 2px ${PP}18` : "none",
+          cursor: canClickInput ? "text" : "default",
+        }}>
+          <I n="search" s={13} c={isTypingUser ? PP : T.textTertiary} />
+          <div style={{ flex: 1, fontSize: 12, minHeight: 18, display: "flex", alignItems: "center" }}>
+            {inputText ? <span style={{ color: T.textPrimary }}>{inputText}<span style={{ display: "inline-block", width: 2, height: 14, background: PP, marginLeft: 1, verticalAlign: "text-bottom", animation: "caret 1s step-end infinite" }} /></span> : <span style={{ color: canClickInput ? T.textSecondary : T.textTertiary, fontStyle: canClickInput ? "normal" : "italic" }}>{inputHint}</span>}
+          </div>
+          <div style={{ width: 26, height: 26, borderRadius: T.rMd, background: isTypingUser ? PP : T.surface1, display: "flex", alignItems: "center", justifyContent: "center", transition: "all .3s" }}><I n="send" s={12} c={isTypingUser ? "#fff" : T.textTertiary} /></div>
+        </div>
+
+        {activeConv && <div style={{ marginTop: T.s3, display: "flex", alignItems: "center", gap: 6, fontSize: 10, color: T.textTertiary }}><I n="database" s={10} c={T.textTertiary} /><span>Data: sys_gen_ai_usage_log, Subscription Mgmt v2, ContractIQ</span></div>}
       </div>}
     </Card>
   );
